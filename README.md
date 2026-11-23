@@ -2,7 +2,7 @@
 
 MinIO 薄网关 —— 坐在 MinIO 前的一层通用服务，讲公开标准（OCI Distribution 制品 + S3 文件）：凭证隔离、presign 签发、S3 数据面转发、IP 绑定闸、审计限流。
 
-> 状态：按 [AGENTS.md](AGENTS.md) 全量实现（auth / presign / proxy / multipart / oci / ops / thumbnail）。权威文档 = AGENTS.md；每个模块的设计在 `src/<module>/design/design.md`，文件级契约在 `src/<module>/spec.md`。
+> 状态：按 [AGENTS.md](AGENTS.md) 全量实现（auth / presign / proxy / multipart / oci / ops / thumbnail）。权威文档 = AGENTS.md；每个模块的设计在 `src/<module>/design/design.md`，文件级契约在同目录 `src/<module>/design/spec.md`。
 
 ## 为什么存在
 

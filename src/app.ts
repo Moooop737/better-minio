@@ -57,7 +57,8 @@ function errorFace(Path: string): 'oci' | 'json' | 's3' {
   return 's3'
 }
 
-function buildApp(Config: GatewayConfig, Deps: AppDeps): Hono<AppEnv> {
+/* 返回 app 与 close（关闭到 MinIO 的转发连接池，优雅关闭最后调用） */
+function buildApp(Config: GatewayConfig, Deps: AppDeps): { app: Hono<AppEnv>; close(): Promise<void> } {
   const App = new Hono<AppEnv>()
   const Tokens = createTokenService(Config.tokenSecret)
   const Verifier = createServiceTokenVerifier(Config.serviceTokens)
@@ -75,7 +76,7 @@ function buildApp(Config: GatewayConfig, Deps: AppDeps): Hono<AppEnv> {
 
   App.use('*', requestIdMiddleware())
   App.use('*', requestLogMiddleware(Deps.logger))
-  if (Config.auditEnabled) App.use('*', auditMiddleware(Deps.logger))
+  if (Config.auditEnabled) App.use('*', auditMiddleware(Deps.logger, { trustedProxies: Config.trustedProxies }))
 
   mountHealth(App, { internalClient: Deps.internal, bucket: Config.s3Bucket, stateStore: Deps.stateStore })
   if (Config.ociEnabled) mountTokenRoute(App, { tokens: Tokens, verifier: Verifier, pushServices: Config.ociPushServices })
@@ -130,7 +131,7 @@ function buildApp(Config: GatewayConfig, Deps: AppDeps): Hono<AppEnv> {
       publicEndpoint: Config.s3PublicEndpoint,
     })
   }
-  mountProxyData(App, {
+  const Data = mountProxyData(App, {
     internalEndpoint: Config.s3InternalEndpoint,
     bucket: Config.s3Bucket,
     dataPlaneGate: createDataPlaneGate({
@@ -143,7 +144,7 @@ function buildApp(Config: GatewayConfig, Deps: AppDeps): Hono<AppEnv> {
     events: Deps.events,
     rateLimit: Limits.data,
   })
-  return App
+  return { app: App, close: () => Data.close() }
 }
 
 /* 后台任务：multipart 清理 / oci chunk 清理 / thumbnail worker；开关关闭即不起 */

@@ -47,7 +47,7 @@ for (const Bucket of Buckets) {
   })
 }
 
-const App = buildApp(Config, Deps)
+const { app: App, close: closeForwarder } = buildApp(Config, Deps)
 const Background = startBackground(Config, Deps)
 
 logger.info({ features: describeFeatures(Config) }, '生效功能集')
@@ -59,6 +59,7 @@ const Server = serve({ fetch: App.fetch, port: Config.port, hostname: Config.hos
 
 const Shutdown = createShutdown({ server: Server, timeoutMs: Config.shutdownTimeout * 1000, logger })
 for (const Task of Background) Shutdown.register(Task.name, () => Task.stop())
+Shutdown.register('forwarder', () => closeForwarder())
 Shutdown.register('state-store', () => StateStore.close())
 Shutdown.register('s3-clients', () => {
   Internal.destroy()

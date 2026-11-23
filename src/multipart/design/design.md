@@ -1,6 +1,6 @@
 # multipart · 设计稿
 
-> 日期：2026-11-23 · 状态：**设计已收口，已落码**（契约见同目录 [spec.md](../spec.md)）
+> 日期：2026-11-23 · 状态：**设计已收口，已落码**（契约见同目录 [spec.md](spec.md)）
 > 开关：`MULTIPART_ENABLED` 默认 `true`；`false` = 五端点不挂（404）、清理定时器不起（AGENTS.md §一·三）。
 > 上游：[AGENTS.md](../../../AGENTS.md) §4.5；[auth 设计](../../auth/design/design.md)（token）、[presign 设计](../../presign/design/design.md)（签名路径）、[proxy 设计](../../proxy/design/design.md)（分片 PUT 走数据面）。
 > 实物依据（2026-10-29 实测）：该 MinIO `ListMultipartUploads` **恒空**、`ListParts(uploadId)` **正常** → 会话必须自持久化 uploadId，对账走 ListParts 可行。

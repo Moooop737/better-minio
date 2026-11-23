@@ -1,6 +1,6 @@
 # auth · spec
 
-> 依据：[design.md](design/design.md)（全部决策已定）。本文件是文件级契约；实现与测试按此对齐。
+> 依据：[design.md](design.md)（全部决策已定）。本文件是文件级契约；实现与测试按此对齐。
 
 ## 文件与签名
 

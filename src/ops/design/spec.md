@@ -1,6 +1,6 @@
 # ops · spec
 
-> 依据 [design.md](./design/design.md)（已收口）。本文是文件级契约；实现与测试按此落地。
+> 依据 [design.md](design.md)（已收口）。本文是文件级契约；实现与测试按此落地。
 
 ## 文件与导出
 

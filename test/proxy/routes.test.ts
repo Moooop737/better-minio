@@ -190,10 +190,19 @@ describe.skipIf(!s3Available)('proxy 数据面 + 控制端点（moto）', () => 
       expect((await S3.client.send(new GetObjectCommand({ Bucket: BUCKET, Key: 'docs/a.txt' }))).ContentLength).toBe(11)
     })
 
-    it('其他 bucket → 404 NoSuchBucket（闸前）；桶级路径 → 404 NoSuchKey', async () => {
-      const Other = await fetch(`${Gw.url}/otherbucket/docs/a.txt`)
-      expect(Other.status).toBe(404)
-      expect(await Other.text()).toContain('<Code>NoSuchBucket</Code>')
+    it('其他 bucket → 404 NoSuchBucket（桶判定先于方法与闸，关闭模块的路径也 404）；桶级路径 → 404 NoSuchKey', async () => {
+      const Cases: [string, string][] = [
+        ['GET', '/otherbucket/docs/a.txt'],
+        ['POST', '/thumbnail/generate'],
+        ['GET', '/v2/'],
+        ['DELETE', '/otherbucket/x'],
+        ['OPTIONS', '/v2/repo/manifests/latest'],
+      ]
+      for (const [Method, Path] of Cases) {
+        const Other = await fetch(`${Gw.url}${Path}`, { method: Method })
+        expect(Other.status, `${Method} ${Path}`).toBe(404)
+        expect(await Other.text()).toContain('<Code>NoSuchBucket</Code>')
+      }
       for (const Path of [`/${BUCKET}`, `/${BUCKET}/`]) {
         const Res = await fetch(`${Gw.url}${Path}`)
         expect(Res.status).toBe(404)

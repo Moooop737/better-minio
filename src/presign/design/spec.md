@@ -1,13 +1,13 @@
 # presign · spec
 
-> 依据：[design.md](design/design.md)（已收口）· AGENTS.md §4.3。
+> 依据：[design.md](design.md)（已收口）· AGENTS.md §4.3。
 
 ## 文件与导出
 
 ### `schema.ts` — 边界校验（zod v4）
 
 ```ts
-export { keySchema, clientIpSchema, expiresInSchema, presignPutSchema, presignGetSchema }
+export { keySchema, clientIpSchema, expiresInSchema, presignPutSchema, presignGetSchema, formatIssues, parseJsonBody }
 export type { PresignPutInput, PresignGetInput }
 ```
 
@@ -21,6 +21,8 @@ export type { PresignPutInput, PresignGetInput }
 | `contentType` / `responseContentDisposition` / `responseContentType` / `responseCacheControl` | 可选，非空 ≤1024，不解析 |
 
 未知字段剥离（zod 默认）。multipart / proxy 复用 `keySchema` / `clientIpSchema` / `expiresInSchema`。
+
+`parseJsonBody(c, schema)`：`c.req.json()` + `safeParse`；坏 JSON / 校验失败 → `GatewayError('E_VALIDATION', …, { issues })`，issues = `[{path, message}]`（不回显值）。
 
 ### `sign.ts` — 签发
 

@@ -1,7 +1,7 @@
 /**
  * proxy 挂载 —— 控制端点与 S3 数据面分两次挂（数据面 catch-all 必须最后挂）。
  *   mountProxyControl：POST /objects/stat、/objects/delete；链 serviceGate → rateLimit → handler。
- *   mountProxyData：`/:bucket/*`（含 `/:bucket`）；链 CORS → 预检查（方法 405 / 桶 404，闸前）→ dataPlaneGate → rateLimit → 透明转发。
+ *   mountProxyData：`/:bucket/*`（含 `/:bucket`）；链 桶 404 → CORS（OPTIONS 204）→ 方法 405 / 桶级 404 → dataPlaneGate → rateLimit → 透明转发。
  * 字节数随流实时 c.set('bytesUp' / 'bytesDown')，ops 审计在 outgoing 'close' 读取；非分片 PUT 成功 emit object:put。
  * 用法：`mountProxyControl(app, deps)`；`const Data = mountProxyData(app, deps)`，优雅关闭最后 `await Data.close()`。
  */
@@ -56,22 +56,26 @@ function mountProxyControl(App: Hono<AppEnv>, Deps: ProxyControlDeps): void {
 
 function mountProxyData(App: Hono<AppEnv>, Deps: ProxyDataDeps): ProxyDataHandle {
   const Upstream = createForwarder({ endpoint: Deps.internalEndpoint })
-  const Precheck: MiddlewareHandler<AppEnv> = async (c, next) => {
+  /* 桶判定最先（连 CORS 预检都在它之后）：非本桶路径（如关闭模块的 /v2/、/thumbnail/）一律 404 NoSuchBucket 而非 405 */
+  const BucketCheck: MiddlewareHandler<AppEnv> = async (c, next) => {
+    if (splitTarget(rawTarget(c)).bucket !== Deps.bucket) {
+      return s3ErrorResponse(c, 404, 'NoSuchBucket', 'The specified bucket does not exist.')
+    }
+    await next()
+  }
+  const MethodCheck: MiddlewareHandler<AppEnv> = async (c, next) => {
     if (!DATA_PLANE_METHODS.has(c.req.method)) {
       c.header('Allow', ALLOW_HEADER)
       return s3ErrorResponse(c, 405, 'MethodNotAllowed', 'The specified method is not allowed against this resource.')
     }
-    const Target = splitTarget(rawTarget(c))
-    if (Target.bucket !== Deps.bucket) {
-      return s3ErrorResponse(c, 404, 'NoSuchBucket', 'The specified bucket does not exist.')
-    }
-    if (!Target.hasKey) return s3ErrorResponse(c, 404, 'NoSuchKey', 'The specified key does not exist.')
+    if (!splitTarget(rawTarget(c)).hasKey) return s3ErrorResponse(c, 404, 'NoSuchKey', 'The specified key does not exist.')
     await next()
   }
   App.all(
     '/:bucket/*',
+    BucketCheck,
     dataPlaneCors(Deps.corsOrigins),
-    Precheck,
+    MethodCheck,
     Deps.dataPlaneGate,
     rateLimitMiddleware(Deps.rateLimit),
     (c) => forward(c, Upstream, Deps.events),

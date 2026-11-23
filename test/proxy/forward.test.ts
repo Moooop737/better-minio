@@ -5,9 +5,11 @@
 
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
+import { fork } from 'node:child_process'
 import { createServer, request as httpRequest } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { createEventBus } from '../../src/core/events'
 import type { AppEnv } from '../../src/core/types'
@@ -188,12 +190,13 @@ describe('保真', () => {
 })
 
 describe('流式与生命周期', () => {
-  it('100MB 上传 + 100MB 下载：不 buffer，RSS 增长 < 60MB', async () => {
+  it('100MB 上传 + 100MB 下载：网关进程 RSS 增长 < 60MB（子进程测量，排除客户端 / 上游内存）', async () => {
     const Chunk = Buffer.alloc(64 * 1024, 7)
     const Total = 100 * MB
-    Behave = (Req, Res) => {
+    let Received = 0
+    const Sink = createServer((Req, Res) => {
       if (Req.method === 'PUT') {
-        Req.resume()
+        Req.on('data', (Data: Buffer) => (Received += Data.length))
         Req.on('end', () => Res.end('done'))
         return
       }
@@ -207,12 +210,15 @@ describe('流式与生命周期', () => {
         Res.end()
       }
       pump()
-    }
-    global.gc?.()
-    const Base = process.memoryUsage().rss
-    let Peak = Base
-    const Sampler = setInterval(() => (Peak = Math.max(Peak, process.memoryUsage().rss)), 10)
+    })
+    await new Promise<void>((Resolve) => Sink.listen(0, '127.0.0.1', () => Resolve()))
+    /* semi-space 压到 1MB：让年轻代垃圾及时回收，测到的是「是否缓冲」而不是 GC 滞后 */
+    const Child = fork(fileURLToPath(new URL('./fixtures/gateway-child.ts', import.meta.url)), [`http://127.0.0.1:${(Sink.address() as AddressInfo).port}`], {
+      execArgv: ['--import', 'tsx', '--max-semi-space-size=1'],
+    })
     try {
+      const Port = await new Promise<number>((Resolve) => Child.once('message', (Msg) => Resolve((Msg as { port: number }).port)))
+      const Url = `http://127.0.0.1:${Port}/${BUCKET}/big.bin`
       let Produced = 0
       const Upload = new ReadableStream<Uint8Array>({
         pull(Controller) {
@@ -221,26 +227,70 @@ describe('流式与生命周期', () => {
           Controller.enqueue(new Uint8Array(Chunk))
         },
       })
-      const Put = await fetch(`${GatewayUrl}/${BUCKET}/big.bin`, { method: 'PUT', body: Upload, duplex: 'half' } as RequestInit)
+      const Put = await fetch(Url, { method: 'PUT', body: Upload, duplex: 'half' } as RequestInit)
       expect(Put.status).toBe(200)
       await Put.text()
-      expect(Requests[0]?.bytes).toBe(Total)
-
-      const Get = await fetch(`${GatewayUrl}/${BUCKET}/big.bin`)
-      expect(Get.headers.get('content-length')).toBe(String(Total))
-      let Received = 0
+      expect(Received).toBe(Total)
+      const Get = await fetch(Url)
+      let Downloaded = 0
       const Reader = Get.body!.getReader()
       for (;;) {
         const { done, value } = await Reader.read()
         if (done) break
-        Received += value.length
+        Downloaded += value.length
       }
-      expect(Received).toBe(Total)
+      expect(Downloaded).toBe(Total)
+      Child.send('report')
+      const Growth = await new Promise<number>((Resolve) => Child.once('message', (Msg) => Resolve((Msg as { growth: number }).growth)))
+      expect(Growth).toBeLessThan(60 * MB)
     } finally {
-      clearInterval(Sampler)
+      Child.kill()
+      Sink.closeAllConnections()
+      await new Promise<void>((Resolve) => Sink.close(() => Resolve()))
     }
-    expect(Peak - Base).toBeLessThan(60 * MB)
   }, 60_000)
+
+  it('下载背压：客户端停读时上游写出量有界（网关不囤积响应体）', async () => {
+    const Chunk = Buffer.alloc(64 * 1024, 1)
+    let Sent = 0
+    Behave = (Req, Res) => {
+      Req.resume()
+      Res.writeHead(200, { 'content-length': String(100 * MB) })
+      const pump = (): void => {
+        while (Sent < 100 * MB) {
+          Sent += Chunk.length
+          if (!Res.write(Chunk)) return void Res.once('drain', pump)
+        }
+        Res.end()
+      }
+      pump()
+    }
+    const Abort = new AbortController()
+    const Res = await fetch(`${GatewayUrl}/${BUCKET}/big.bin`, { signal: Abort.signal })
+    const Reader = Res.body!.getReader()
+    await Reader.read()
+    await new Promise((Resolve) => setTimeout(Resolve, 500))
+    expect(Sent).toBeLessThan(20 * MB)
+    Abort.abort()
+  })
+
+  it('上传背压：上游停读时客户端产出量有界（网关不囤积请求体）', async () => {
+    Behave = (Req) => Req.pause()
+    const Chunk = Buffer.alloc(64 * 1024, 2)
+    let Produced = 0
+    const Req = httpRequest(`${GatewayUrl}/${BUCKET}/up.bin`, { method: 'PUT', headers: { 'content-length': String(100 * MB) } })
+    Req.on('error', () => {})
+    const pump = (): void => {
+      while (Produced < 100 * MB) {
+        Produced += Chunk.length
+        if (!Req.write(Chunk)) return void Req.once('drain', pump)
+      }
+    }
+    pump()
+    await new Promise((Resolve) => setTimeout(Resolve, 500))
+    expect(Produced).toBeLessThan(20 * MB)
+    Req.destroy()
+  })
 
   it('下载中客户端断连 → 上游响应被销毁', async () => {
     Behave = (Req, Res) => {

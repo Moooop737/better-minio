@@ -59,7 +59,7 @@ describe.skipIf(!s3Available)('buildApp 装配', () => {
 
   it('默认功能集：OCI / thumbnail 不挂，multipart 挂', async () => {
     const Lines: string[] = []
-    const App = buildApp(configFor(S3.endpoint), depsFor(S3, Lines))
+    const { app: App } = buildApp(configFor(S3.endpoint), depsFor(S3, Lines))
     expect((await App.request('/v2/')).status).toBe(404)
     expect((await App.request('/token')).status).toBe(404)
     expect((await App.request('/thumbnail/generate', { method: 'POST' })).status).toBe(404)
@@ -72,7 +72,7 @@ describe.skipIf(!s3Available)('buildApp 装配', () => {
 
   it('开关全反：OCI / thumbnail 挂，multipart 不挂', async () => {
     const Lines: string[] = []
-    const App = buildApp(
+    const { app: App } = buildApp(
       configFor(S3.endpoint, { OCI_ENABLED: 'true', THUMBNAIL_ENABLED: 'true', MULTIPART_ENABLED: 'false' }),
       depsFor(S3, Lines),
     )
@@ -94,7 +94,7 @@ describe.skipIf(!s3Available)('buildApp 装配', () => {
 
   it('控制面 401 渲染 JSON；数据面 401 渲染 S3 XML；日志不含 token / MinIO 地址', async () => {
     const Lines: string[] = []
-    const App = buildApp(configFor(S3.endpoint), depsFor(S3, Lines))
+    const { app: App } = buildApp(configFor(S3.endpoint), depsFor(S3, Lines))
     const Json = await App.request('/objects/stat', { method: 'POST', body: '{}' })
     expect(await Json.json()).toMatchObject({ code: 'E_SERVICE_TOKEN' })
     const Xml = await App.request('/kbfile/a.txt?access_token=abc.def.ghi&X-Amz-Signature=deadbeef')

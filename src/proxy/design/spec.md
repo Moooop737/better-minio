@@ -1,6 +1,6 @@
 # proxy · spec
 
-> 依据：[design.md](design/design.md)（已收口）· AGENTS.md §4.2。本文是文件级契约；与设计冲突以设计为准，设计缺口先回写设计。
+> 依据：[design.md](design.md)（已收口）· AGENTS.md §4.2。本文是文件级契约；与设计冲突以设计为准，设计缺口先回写设计。
 
 ## 文件与导出
 
@@ -30,7 +30,7 @@ export { dataPlaneCors, CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS, CORS_EXPOSE_HEAD
 function dataPlaneCors(Origins: string[]): MiddlewareHandler<AppEnv>
 ```
 
-- `OPTIONS` 一律 204，不过闸；Origin 命中白名单才带 `Access-Control-Allow-Origin: <origin>`、`Allow-Methods: GET, PUT, HEAD, OPTIONS`、`Allow-Headers: content-type, range, if-none-match, x-amz-*`（另回显预检请求的 `Access-Control-Request-Headers` 中属于 `x-amz-*` 的具体名，因 `x-amz-*` 通配非标准）、`Max-Age: 86400`。
+- 本桶路径的 `OPTIONS` 一律 204，不过闸（非本桶路径先被 bucketCheck 404）；Origin 命中白名单才带 `Access-Control-Allow-Origin: <origin>`、`Allow-Methods: GET, PUT, HEAD, OPTIONS`、`Allow-Headers: content-type, range, if-none-match, x-amz-*`（另回显预检请求的 `Access-Control-Request-Headers` 中属于 `x-amz-*` 的具体名，因 `x-amz-*` 通配非标准）、`Max-Age: 86400`。
 - 非 OPTIONS：命中白名单 → 响应（含错误响应）加 `Allow-Origin` + `Expose-Headers: ETag, Content-Length, Content-Range, Accept-Ranges, x-amz-request-id, x-amz-version-id, x-amz-*`。
 - 白名单非空时所有响应加 `Vary: Origin`；无 `Allow-Credentials`；白名单空 = 不出任何 CORS 头。
 
@@ -64,7 +64,7 @@ export { createObjectHandlers, objectKeyBodySchema }
 function createObjectHandlers(Deps: { internal: S3Client; bucket: string; events: EventBus }): { stat: Handler<AppEnv>; remove: Handler<AppEnv> }
 ```
 
-- body `{key}`，key 用 presign 的 `keySchema`（同校验）。坏 JSON / 校验失败 → 400 `E_VALIDATION`。
+- body `{key}`，key 用 presign 的 `keySchema` + `parseJsonBody`（同校验）。坏 JSON / 校验失败 → 400 `E_VALIDATION`。
 - stat：200 `{size, contentType, etag}`；不存在 → 404 `E_NOT_FOUND`。
 - delete：204（不存在也 204）；成功 emit `object:delete {key}`。
 - api 层失败（ObjectStoreError）→ 502 `E_UPSTREAM`（message 通用）。`auditKey = key`。
@@ -80,8 +80,10 @@ interface ProxyDataHandle { close(): Promise<void> }   // 关闭上游连接池�
 ```
 
 - 控制：`POST /objects/stat`、`POST /objects/delete`，链 = serviceGate → rateLimit → handler。
-- 数据：`App.all('/:bucket/*')`（Hono 该模式也匹配 `/:bucket`），链 = cors → precheck → dataPlaneGate → rateLimit → forward。
-  - precheck（闸前）：方法 ∉ {GET, HEAD, PUT} → 405 `MethodNotAllowed`（`Allow: GET, HEAD, PUT, OPTIONS`）；首段 bucket ≠ 配置 → 404 `NoSuchBucket`；bucket 对但无 key（桶级操作，不暴露）→ 404 `NoSuchKey`。
+- 数据：`App.all('/:bucket/*')`（Hono 该模式也匹配 `/:bucket`），链 = bucketCheck → cors → methodCheck → dataPlaneGate → rateLimit → forward。
+  - bucketCheck（最先，含 OPTIONS）：首段 bucket ≠ 配置 → 404 `NoSuchBucket`。理由：catch-all 也兜住关闭模块的路径（`OCI_ENABLED=false` 的 `/v2/`、`THUMBNAIL_ENABLED=false` 的 `/thumbnail/*`），这些必须是 404 而非 405。
+  - cors：OPTIONS 204（不过闸）。
+  - methodCheck（闸前）：方法 ∉ {GET, HEAD, PUT} → 405 `MethodNotAllowed`（`Allow: GET, HEAD, PUT, OPTIONS`）；bucket 对但无 key（桶级操作，不暴露）→ 404 `NoSuchKey`。
   - forward：body = `c.env.incoming` 经计数 Transform（GET/HEAD 不带 body）；客户端断连（outgoing `close` 且未写完）→ abort 上游；响应体 pull 式 ReadableStream（背压），cancel → 销毁上游 body。
   - 字节计数：随流实时 `c.set('bytesUp' | 'bytesDown')`（ops 审计在 outgoing `close` 时读）。
   - 事件：PUT 且上游 2xx 且 query 无 `partNumber` / `uploadId` → emit `object:put {key: identity.key, contentType: 请求 content-type ?? null, size: bytesUp}`。
@@ -91,5 +93,5 @@ interface ProxyDataHandle { close(): Promise<void> }   // 关闭上游连接池�
 
 - `s3-error.test.ts`：映射表、429 Retry-After、未知 500 通用、RequestId、HEAD 无 body、XML 转义。
 - `cors.test.ts`：白名单预检头、非白名单 204 无头、白名单空无头、Vary、Expose。
-- `forward.test.ts`（假上游 node:http，测转发器本身）：Host 原样、原始 target 保真（空格/中文/`+`/`%2B`）、hop-by-hop 剥离、上游 `access-control-*` 剥离、上游不可达 502 XML 且不含地址、100MB 上传+下载 RSS 增长 < 60MB、客户端断连 → 上游请求被销毁（下载与上传两向）、bytesUp/bytesDown 计数。
-- `routes.test.ts`（moto 端到端：mountPresign → 网关 → moto）：GET 200 / Range 206 / HEAD ETag；PUT 200 + object:put 事件；分片 PUT 不发事件；If-None-Match `*` 412；特殊字符 key 往返；无 token / 篡改 token 401 XML；换 IP 403；get token 打 PUT 403；DELETE/POST 405；他桶 404；桶级 404；`/objects/stat` 200/404；`/objects/delete` 204×2 + 事件；无 service token 401；CORS 预检 + 实际响应 expose ETag；错误体与日志无 MinIO 地址 / token。
+- `forward.test.ts`（假上游 node:http，测转发器本身）：Host 原样、原始 target 保真（空格/中文/`+`/`%2B`）、hop-by-hop 剥离、上游 `access-control-*` 剥离、上游错误 XML 原样透传、上游不可达 502 XML 且不含地址、100MB 上传+下载网关子进程 RSS 增长 < 60MB（`fixtures/gateway-child.ts`，`--max-semi-space-size=1`）、上下行背压有界、客户端断连 → 上游请求被销毁（下载与上传两向）、bytesUp/bytesDown 计数。
+- `routes.test.ts`（moto 端到端：mountPresign → 网关 → moto）：GET 200 / Range 206 / HEAD ETag；PUT 200 + object:put 事件；分片 PUT 不发事件；If-None-Match `*` 412；特殊字符 key 往返；无 token / 篡改 token 401 XML；换 IP 403；get token 打 PUT 403；DELETE/POST 405；他桶 404（含 POST /thumbnail/x、GET /v2/、OPTIONS 他桶，桶判定先于方法）；桶级 404；`/objects/stat` 200/404；`/objects/delete` 204×2 + 事件；无 service token 401；CORS 预检 + 实际响应 expose ETag；错误体与日志无 MinIO 地址 / token。

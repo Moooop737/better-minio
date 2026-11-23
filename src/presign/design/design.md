@@ -1,6 +1,6 @@
 # presign · 设计稿
 
-> 日期：2026-11-23 · 状态：**设计已收口，未落码**
+> 日期：2026-11-23 · 状态：**已落码**（契约见 [spec.md](spec.md)）
 > 上游：[AGENTS.md](../../../AGENTS.md) §4.3；[auth 设计](../../auth/design/design.md)（token 契约已收口，本模块直接消费）。
 > 下游：实现前先读本文件 → 同目录产出 `spec.md` → 按 spec 落码。
 > 实物依据：[api/presign.ts](../../api/presign.ts)（原语已落）、[api/object-store.ts](../../api/object-store.ts)（类型/TTL 边界已落）；「签名前注入自定义 query」手法 2026-10-29 已实测（build 步骤中间件改 `args.request.query`，签名覆盖它；签后追加 → 403）。
@@ -110,7 +110,7 @@ zod 在边界一次 parse（D2），规则：
 
 错误口径（auth §六 core 约定，控制面渲染 JSON `{code,message}`）：
 
-- 校验失败 / 缺 `client_ip` / 缺 `sub` → **400 `E_VALIDATION`**（边界错误，不走 api 的 `E_OBJECT_STORE`）。
+- 校验失败 / 缺 `client_ip` / 缺 `sub` / 坏 JSON → **400 `E_VALIDATION`**（边界错误，不走 api 的 `E_OBJECT_STORE`）；体带 `issues: [{path, message}]`，只含字段路径与规则文案，**不回显请求值**（2026-11-23 补）。
 - service token 缺失/错 → 401 `E_SERVICE_TOKEN`（gate 抛）。
 - 签名意外失败 → 500 `E_INTERNAL`，message 不含 MinIO 地址 / 凭证。
 - **任何响应与日志不含完整 URL / token**（脱敏红线）；审计只记事实：`who=服务名, sub, key, op, ip, jti, exp`。
@@ -123,6 +123,9 @@ src/presign/
   sign.ts     signPut / signGet：铸 token → extraQuery → 原语签名
   routes.ts   mountPresign(app, deps)：挂两端点，内联 serviceGate
 ```
+
+- 实际 deps（2026-11-23）= `{ publicClient, bucket, tokens, serviceGate, keyScheme, rateLimit, now? }`；`schema.ts` 另导出 `keySchema / clientIpSchema / expiresInSchema / parseJsonBody` 供 multipart 与 proxy 控制端点复用同一校验口径；`sign.ts` 导出 `applyKeyScheme` 供 multipart create 复用。
+- 签发事实以 `logger.info({event:'presign', service, sub, op, key, ip, jti, exp})` 落日志（不受 AUDIT_ENABLED 影响，属基础请求日志；不含 URL / token）。
 
 - 装配（index.ts）：新建 **public S3 client**（`S3_PUBLIC_ENDPOINT`，其余配置同 internal）——现 index 只有 internal，注释已预留「public 随 presign 一起加」。deps = `{ publicClient, bucket, tokenService, serviceGate }`，工厂注入，不引 DI 容器。
 - 新增依赖：`zod`。

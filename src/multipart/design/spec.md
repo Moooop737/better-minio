@@ -1,6 +1,6 @@
 # multipart · spec
 
-> 依据：[design.md](design/design.md)（全部决策已定）· AGENTS.md §4.5。本文是文件级契约，代码按此落。
+> 依据：[design.md](design.md)（全部决策已定）· AGENTS.md §4.5。本文是文件级契约，代码按此落。
 
 ## 文件与导出
 

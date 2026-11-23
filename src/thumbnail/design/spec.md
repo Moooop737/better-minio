@@ -1,6 +1,6 @@
 # thumbnail · spec
 
-> 依据 [design.md](./design/design.md)（已收口）。`THUMBNAIL_ENABLED=false` 时 index 不调用本模块任何入口（路由不挂、订阅不接、worker 不起）。
+> 依据 [design.md](design.md)（已收口）。`THUMBNAIL_ENABLED=false` 时 index 不调用本模块任何入口（路由不挂、订阅不接、worker 不起）。
 
 ## 文件与导出
 

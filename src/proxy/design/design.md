@@ -1,6 +1,6 @@
 # proxy · 设计稿
 
-> 日期：2026-11-23 · 状态：**设计已收口，未落码**
+> 日期：2026-11-23 · 状态：**已落码**（契约见 [spec.md](spec.md)）
 > 上游：[AGENTS.md](../../../AGENTS.md) §4.2；[auth 设计](../../auth/design/design.md)（数据面闸）、[presign 设计](../../presign/design/design.md)（URL 怎么来的）。
 > 下游：实现前先读本文件 → 同目录产出 `spec.md` → 按 spec 落码。
 
@@ -28,7 +28,8 @@ Hono 按注册顺序首匹配，**控制面先挂、S3 catch-all 最后**：
 /:bucket/*         proxy（S3 数据面 catch-all，最后挂）
 ```
 
-- catch-all 只认 `bucket === S3_BUCKET`；其他 bucket → 404 S3 XML `NoSuchBucket`。
+- catch-all 只认 `bucket === S3_BUCKET`；其他 bucket → 404 S3 XML `NoSuchBucket`。**桶判定最先**（先于 CORS 预检、方法面、闸）：catch-all 同时兜住关闭模块的路径（`OCI_ENABLED=false` 的 `/v2/*`、`THUMBNAIL_ENABLED=false` 的 `/thumbnail/*`），它们必须 404 而不是 405（2026-11-23 补）。
+- 本桶但无 key（`/<bucket>`、`/<bucket>/`，桶级操作不暴露）→ 404 `NoSuchKey`。
 - **方法面（D2）**：数据面只开 GET/HEAD/PUT（对应 op get/put）。DELETE/POST 等 → **405 S3 XML `MethodNotAllowed`**：auth 没有 delete op（删除走 `/objects/delete`），multipart 的 create/complete/abort 走控制端点不开 presigned POST。AGENTS.md 端点表的 DELETE 标注同步收窄。
 - 未匹配路径 → 404 S3 XML `NoSuchKey`（数据面）/ JSON（控制面），不泄内部路由表。
 
@@ -53,8 +54,8 @@ Hono 按注册顺序首匹配，**控制面先挂、S3 catch-all 最后**：
 
 ### 2.3 header 过滤
 
-- 请求方向：客户端 header 全透传，**剥 hop-by-hop**（`connection / keep-alive / transfer-encoding / te / trailer / upgrade / proxy-*`）；`content-length` 有则保留。
-- 响应方向：MinIO status + header 原样回，剥同一组 hop-by-hop；`ETag / Content-Range / Accept-Ranges / x-amz-*` 必须到达浏览器（CORS expose 配合）。
+- 请求方向：客户端 header 全透传，**剥 hop-by-hop**（`connection / keep-alive / transfer-encoding / te / trailer / upgrade / proxy-*`，及 `Connection` 头点名的字段）；`content-length` 有则保留。另剥 `expect`：Node 入口已自动应答 100-continue，undici 不接受该头；presigned 的 SignedHeaders 只有 host / content-type，剥它不碎签名（2026-11-23 补）。
+- 响应方向：MinIO status + header 原样回，剥同一组 hop-by-hop，另剥 `access-control-*`（MinIO 默认对任意 Origin 回 `*`，会绕过网关白名单；CORS 策略只归 §四）；`ETag / Content-Range / Accept-Ranges / x-amz-*` 必须到达浏览器（CORS expose 配合）。
 - 上游错误响应（MinIO 的 S3 XML）**原样透传**（D5）：已是标准 S3 错误体，不含 MinIO 地址；RequestId/Resource 是客户端自己请求的信息，不算泄露。
 
 ### 2.4 流式与生命周期
@@ -95,6 +96,11 @@ Hono 按注册顺序首匹配，**控制面先挂、S3 catch-all 最后**：
 | `E_OP_MISMATCH / E_PATH_MISMATCH / E_IP_MISMATCH` | 403 | `AccessDenied` |
 | bucket 不符 | 404 | `NoSuchBucket` |
 | 方法不开 | 405 | `MethodNotAllowed` |
+| `E_RATE_LIMIT` | 429 | `SlowDown`（+ `Retry-After`） |
+| `E_UPSTREAM`（MinIO 连不上 / 响应头超时） | 502 | `ServiceUnavailable` |
+| 未知异常 / `E_INTERNAL` | 500 | `InternalError`（固定通用文案） |
+
+（2026-11-23 补全：429 / 502 / 500 三行；其余 GatewayError 映射见 spec。HEAD 请求错误只回状态与头、无 body。）
 
 - Message 通用化（不泄 MinIO 地址 / 内部 code 细节）；RequestId 用网关自己的 trace id。
 - MinIO 上游错误 XML 原样透传（§2.3），不重包。
@@ -103,14 +109,15 @@ Hono 按注册顺序首匹配，**控制面先挂、S3 catch-all 最后**：
 
 ```
 src/proxy/
-  forward.ts    forwardToMinio(rawTarget, method, headers, body, signal) → {status, headers, body}
+  forward.ts    createForwarder({endpoint}).forward({rawTarget, method, headers, body, signal}) → {status, headers, body}
   cors.ts       dataPlaneCors(origins) middleware
   s3-error.ts   renderS3Error(GatewayError) / 上游透传判定
   objects.ts    /objects/stat /objects/delete handlers（api.stat/delete）
-  routes.ts     mountProxy(app, deps)：控制端点 + S3 catch-all（最后挂）
+  routes.ts     mountProxyControl(app, deps)：控制端点；mountProxyData(app, deps)：S3 catch-all（最后挂）
 ```
 
-- deps = `{ internalEndpoint, bucket, dataPlaneGate, serviceGate, corsOrigins }`；转发器目标 = `S3_INTERNAL_ENDPOINT`（真连接），与签名 Host（public）无关。
+- 拆成两个挂载函数（2026-11-23）：控制端点与 catch-all 的挂载位置不同（catch-all 必须在所有模块之后）。control deps = `{ internal, bucket, serviceGate, events, rateLimit }`；data deps = `{ internalEndpoint, bucket, dataPlaneGate, corsOrigins, events, rateLimit }`，返回 `{ close() }` 供优雅关闭收上游连接池。
+- 事件：非分片 PUT（query 无 `partNumber`/`uploadId`）上游 2xx → `object:put`；`/objects/delete` 成功 → `object:delete`。转发器目标 = `S3_INTERNAL_ENDPOINT`（真连接），与签名 Host（public）无关。
 - 新增依赖：`undici`（spike 不过则零依赖退 node:http）。
 - 配置新增：`CORS_ORIGINS`（默认空）。
 
@@ -118,7 +125,7 @@ src/proxy/
 
 1. presigned GET 经网关 → 200；Range → 206 + Content-Range；HEAD → 200 带 ETag。
 2. presigned PUT 正确类型 → 200；`If-None-Match: *` 命中已存在 → 412（MinIO 出，透传）。
-3. 100MB 上传 + 下载：进程 RSS 平稳（spike 2 的正式验收）。
+3. 100MB 上传 + 下载：网关进程 RSS 增长 < 60MB（spike 2 的正式验收）。测法：网关跑在子进程（排除客户端 / 假上游内存），`--max-semi-space-size=1` 让年轻代垃圾及时回收——默认 semi-space 下 GC 滞后会让 RSS 虚高 ~85MB，与是否缓冲无关；另以背压用例直接证明「停读则上游停写」。
 4. key 含空格 / 中文 / `+`：签名不碎（spike 3）。
 5. 闸：无 token 401 XML；换 IP 403 XML；get token 打 PUT 403。
 6. DELETE/POST 数据面 → 405 XML；其他 bucket → 404 NoSuchBucket。
