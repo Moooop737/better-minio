@@ -8,7 +8,7 @@
 
 立项理由：**presigned URL 绑不了 IP**，MinIO 只验 S3 签名、不看 IP。要「换网络即拒」、要凭证隔离、要审计，只能有一层闸站在 MinIO 前——就是它。
 
-**拓扑（已定）：网关自己就是标准 S3 端点**（公开 `:9100`），前置内网 MinIO（`127.0.0.1:9000`）。presigned URL 由网关用 MinIO 凭证签（Host=网关公开地址），浏览器 / 后端都打网关；网关校验 `x-kc-token` / IP 后**透明代理**到 MinIO（method/path/query/headers/Host 全保持，签名不变由 MinIO 验）。Caddy 只做 TLS 终止，不做数据面反代、不需要 forward_auth。
+**拓扑（已定）：网关自己就是标准 S3 端点**（公开 `:9100`），前置内网 MinIO（`127.0.0.1:9000`）。presigned URL 由网关用 MinIO 凭证签（Host=网关公开地址），浏览器 / 后端都打网关；网关校验 `access_token`（JWT）/ IP 后**透明代理**到 MinIO（method/path/query/headers/Host 全保持，签名不变由 MinIO 验）。Caddy 只做 TLS 终止，不做数据面反代、不需要 forward_auth。
 
 ## 一 · 全量实现指令（关键）
 
@@ -44,7 +44,7 @@
 
 ## 二 · 技术栈
 
-Node + TypeScript + Hono + `@hono/node-server` + `@aws-sdk/client-s3` v3 + `jose`（标准 JWT）。同 `app/server` 口径：`strict`、`exactOptionalPropertyTypes`、`verbatimModuleSyntax`、`noUncheckedIndexedAccess`。
+Node + TypeScript + Hono + `@hono/node-server` + `@aws-sdk/client-s3` v3 + `jose`（标准 JWT）+ `zod`（边界校验）+ `undici`（透明转发）+ `pino`（日志）+ `rate-limiter-flexible`（限流）+ `ioredis`（可选状态）+ `sharp`（可选缩略图）。测试 `vitest`；集成用例用 moto server 作 S3 替身（不验 SigV4 签名，签名正确性由 MinIO 负责）。同 `app/server` 口径：`strict`、`exactOptionalPropertyTypes`、`verbatimModuleSyntax`、`noUncheckedIndexedAccess`。
 
 **状态持久化**：可选 Redis（`REDIS_URL`，ioredis）——给了就落 Redis，不给全存内存（重启丢，显式接受）；给了但启动连不上 → 拒启。适用域 = 瞬态（分片/上传会话、限流计数）；持久 registry 状态（OCI tag 索引）落 MinIO 对象。
 
@@ -79,9 +79,11 @@ test/             镜像 src/ 结构
 | 端点 | 方法 | 归属 |
 |---|---|---|
 | `/health` | GET | ops |
-| `/<bucket>/<key>`（标准 S3 路径） | GET/PUT/HEAD/DELETE | proxy（透明代理 MinIO） |
+| `/<bucket>/<key>`（标准 S3 路径） | GET/PUT/HEAD（其余 405） | proxy（透明代理 MinIO） |
 | `/objects/stat` `/objects/delete` | POST | proxy（服务端控制，服务 token） |
 | `/presign/put` `/presign/get` | POST | presign |
+| `/multipart/create` `/multipart/sign-part` `/multipart/list-parts` `/multipart/complete` `/multipart/abort` | POST | multipart（`MULTIPART_ENABLED`） |
+| `/thumbnail/generate` | POST | thumbnail（`THUMBNAIL_ENABLED`） |
 | `/token` | GET | auth（OCI bearer） |
 | `/v2/*` | * | oci |
 
@@ -100,10 +102,11 @@ test/             镜像 src/ 结构
 ### 4.2 `proxy/` · 数据面 = 标准 S3 端点
 
 网关自己就是标准 S3 端点，**透明代理**到内网 MinIO（`127.0.0.1:9000`）：
-- 浏览器 / 后端都用 presigned URL 打网关（标准 S3 路径 `GET/PUT/HEAD/DELETE /<bucket>/<key>`）；网关校验 token/IP 后**原样转发**给 MinIO（method/path/query/headers/Host 全保持，body stream pipe 禁 buffer），MinIO 验 S3 签名。
+- 浏览器 / 后端都用 presigned URL 打网关（标准 S3 路径 `GET/PUT/HEAD /<bucket>/<key>`；DELETE/POST → 405 `MethodNotAllowed`，删除走 `/objects/delete`）；网关校验 token/IP 后**原样转发**给 MinIO（method/path/query/headers/Host 全保持，body stream pipe 禁 buffer），MinIO 验 S3 签名。
 - 后端少数服务端动作（stat/delete 等 presigned 不便）走控制端点 `/objects/stat` `/objects/delete`（服务 token），网关用 MinIO 凭证执行。
 - 路由分流：`/v2`（oci）· 标准 S3 路径（proxy）· `/presign` `/token` `/health`（控制）。
-- **验收**：100MB 流式不 OOM；Range `206`；`If-None-Match` 命中 `412`；Host 透传签名通过；presigned 直连网关 `200/206`。
+- 数据面 CORS：`CORS_ORIGINS` 白名单（默认空 = 不开），OPTIONS 预检不过闸。错误体：数据面 S3 XML、控制面 JSON `{code,message}`。
+- **验收**：100MB 流式不 OOM；Range `206`；`If-None-Match` 命中 `412`；Host 透传签名通过；presigned 直连网关 `200/206`；DELETE/POST `405`；其他 bucket `404 NoSuchBucket`。
 
 ### 4.3 `presign/` · 签发控制面
 
@@ -112,6 +115,7 @@ test/             镜像 src/ 结构
 - 可选 `KEY_SCHEME=date`（默认 flat）：put / multipart create 加 `YYYY/MM/` 前缀，**响应恒回实际 key**（token 绑实际 key）；撞名裁决归后端。
 - 注入 `access_token`（**标准 JWT**，jose HS256，网关自验；query 参数签进 URL；claims：`sub/resource_id/key/op/exp/ip/jti/aud`）。
 - key 由业务后端生成；PUT body 不签；checksum `WHEN_REQUIRED`。
+- 校验失败（缺 `client_ip`/`sub`、TTL 越界、key 以 `/` 开头等）→ 400 `E_VALIDATION`；无 service token → 401。
 - **验收**：token 篡改/过期 → 401；TTL 边界 1–604800 拒绝越界；类型不符 PUT 403。
 
 ### 4.4 `auth/` · 鉴权（网关即闸，每个请求上跑）
@@ -125,27 +129,28 @@ test/             镜像 src/ 结构
 
 ### 4.5 `multipart/` · 分片（大文件触发点，但规格全量实现）
 
-- `upload_session` 状态：`create / signPart / listParts / complete / abort`（该 MinIO `ListMultipartUploads` 恒空 → **自持久化 uploadId**）。
+- 端点 `POST /multipart/{create,sign-part,list-parts,complete,abort}`（service token）；会话头存 StateStore（Redis/内存，`MULTIPART_SESSION_TTL` 默认 24h），uploadId 即会话 id（该 MinIO `ListMultipartUploads` 恒空 → **自持久化 uploadId**）；part 清单不存，ListParts 为真源。
+- create 必填 `partSize`（≥5 MiB，会话内不变）。
 - `complete`：逐片 ETag 对账；**缺片返回重签 URL 自愈**（不报错）。
 - 断点续传：按 `uploadId` + `listParts` 恢复。
-- 过期 `upload_session` 清理（按表扫，定时 abort）。
-- checksum `WHEN_REQUIRED`；非末片 5 MiB 下限。与秒传/去重冲突 → 归业务侧，网关不判。
-- **验收**：多片合并 SHA-256 一致；缺片重签；过期清理；非末片 <5MiB 报 `EntityTooSmall`。
+- 过期会话清理（每 5 min 扫 StateStore，abort + 删）；无 Redis 重启的孤儿 upload 由 MinIO 桶 ILM 兜底（部署侧）。
+- checksum `WHEN_REQUIRED`；非末片必须精确等于 `partSize`、末片 ≤ `partSize`（蕴含 5 MiB 下限）→ 否则 400 `E_PART_SIZE_MISMATCH`。ETag 不符视同缺片（200 自愈）。与秒传/去重冲突 → 归业务侧，网关不判。
+- **验收**：多片合并 SHA-256 一致；缺片 / ETag 不符重签；过期清理；非末片 ≠ partSize（含 <5MiB）报 `E_PART_SIZE_MISMATCH`。
 
 ### 4.6 `oci/` · 制品（.kcplan）
 
 - `/v2/` API：`GET /v2/`；`HEAD/GET/PUT/DELETE /v2/<name>/manifests/<ref>`；`HEAD/GET /v2/<name>/blobs/<digest>`；`POST/PATCH/PUT/DELETE /v2/<name>/blobs/uploads/...`；`GET /v2/<name>/tags/list`。
 - `.kcplan` → OCI artifact：config=`application/vnd.kc.plan.config.v1+json`、layer=`.kcplan` zip（`application/vnd.kc.plan.layer.v1.tar+gzip`）、manifest annotations=`name/version/plan_id/protocol_version/source/required_capabilities`、tag=version、digest=sha256。
-- 存储：blob/manifest → MinIO object（key=digest）；`tag→digest` 索引 → 每 repo 一个 MinIO 对象（registry 状态，非文件元数据）。
-- D1 push / D2 pull；悬挂 blob GC（触发点）。
+- 存储：独立 registry 桶 `S3_REGISTRY_BUCKET`（默认 `kcregistry`）；blob/manifest → `blobs/sha256/<hex>`（内容寻址，跨 repo 共享）；`tag→digest` 索引 → 每 repo 一个 MinIO 对象 `repos/<name>/index.json`（registry 状态，非文件元数据，无 Redis 重启不丢）；上传 chunk → `uploads/<uuid>/…`（收尾流式 hash + CopyObject）。tag 不可变（同 digest 幂等、异 digest 409）。
+- D1 push / D2 pull；上传 chunk 清理实现；悬挂 blob GC（触发点，先不做）。
 - **验收**：`oras push` / `oras pull` 通；digest 校验；tag 解析正确；错误码符合 distribution spec。
 
 ### 4.7 `ops/` · 安全运维
 
-- `/health`：MinIO 探测 + 桶健康。
-- audit：`who / key / op / 结果`；**脱敏**（不记完整 presign URL / Location / 凭证）。
-- rate-limit：按用户 / 服务 / 路径。
-- 结构化日志；优雅关闭。
+- `/health`：MinIO 探测 + 桶健康 +（配了 Redis 时）Redis PING；任一 down → 503。
+- audit：stdout 结构化日志行（`event:'audit'`）`who / key / op / 结果 / 字节数`；**脱敏**（不记完整 presign URL / Location / 凭证）。
+- rate-limit：按面 × 身份（控制面 per-service 60/min、数据面 per-sub 300/min、OCI 120/min，env 可调）；429 按面渲染（JSON / S3 `SlowDown` / `TOOMANYREQUESTS`）+ `Retry-After`。
+- 结构化日志（pino，request_id）；优雅关闭（drain，`SHUTDOWN_TIMEOUT` 默认 30s 超时强退）。
 - **验收**：日志不含 secret / 完整 URL；限流 `429`；优雅关闭不丢在途。
 
 ## 五 · 边界（不做）

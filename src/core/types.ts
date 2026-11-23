@@ -3,9 +3,10 @@
  * 各闸 `c.set('identity', …)`；proxy 记字节数 `c.set('bytes', …)`；审计取 auditKey 作为 key。
  */
 
-export type { Identity, BrowserIdentity, ServiceIdentity, RegistryIdentity, AppEnv, AppVariables, NodeBindings }
+export type { Identity, BrowserIdentity, ServiceIdentity, RegistryIdentity, AppEnv, AppVariables, NodeBindings, RateLimit }
 
 import type { HttpBindings } from '@hono/node-server'
+import type { Context } from 'hono'
 
 interface BrowserIdentity {
   kind: 'browser'
@@ -47,3 +48,7 @@ interface AppEnv {
   Bindings: NodeBindings
   Variables: AppVariables
 }
+
+/* 按面限流：读 c 里已挂的 identity 消耗配额；超额抛 GatewayError('E_RATE_LIMIT', …, { retryAfter: 秒 })。
+ * 限流在闸之后调用（先认身份）；RATE_LIMIT_ENABLED=false 时各面拿到 null、不调用。 */
+type RateLimit = (c: Context<AppEnv>) => Promise<void>

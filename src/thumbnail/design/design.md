@@ -97,3 +97,11 @@ src/thumbnail/
 | D3 | 队列 | Redis list / 内存，跟持久化策略；并发 1；重试 ≤3 | **已定**（默认通过） |
 | D4 | 格式/参数 | webp / 宽 300 / 质 80，env 可调；svg 不做 | **已定**（默认通过） |
 | D5 | 取用 | 约定即接口，走既有 presignGet，无新读端点 | **已定**（默认通过） |
+## 九 · 实现期补充决策（2026-11-23，spec 同步）
+
+- **bmp**：sharp 官方 prebuilt libvips 无 BMP loader。可解码集合 = 设计集合 ∩ 运行时 `sharp.format[*].input` 能力；prebuilt 构建上 bmp 不入队、端点 400，而不是入队后注定失败 3 次。自建带 magick 的 libvips 时自动启用。
+- 派生扩展名直接取格式名：`previews/<key>.webp` / `.jpeg` / `.png`。
+- 重试口径：**总尝试 3 次**（首次 + 2 次重试），第 3 次失败丢弃 + error 日志；回队前若队列已有同 key 新 job 则不回（新覆盖旧）。
+- 事件 `contentType` 为 null → 不入队（不额外 HEAD 猜类型；显式端点可补）。
+- 删除与加工竞态：删除时若同 key 正在加工，加工完成后再删一次派生（防删后复活）。
+- 显式端点：解码失败 400 `E_VALIDATION`；存储失败 502 `E_UPSTREAM`；`previews/` key 400。

@@ -1,6 +1,7 @@
 /**
  * 结构化日志（pino）+ request_id 上下文（AsyncLocalStorage）。
  * 红线：URL 一律不整条进日志（query 含 access_token / X-Amz 签名）；redact 剥 authorization / token / secret。
+ * serializer：顶层 `url` / `path` 只留 pathname；`location`（presign 回的整条 URL）一律 [redacted]。
  * 用法：`logger.info({...}, 'msg')`；请求内日志自动带 request_id（mixin）。
  */
 
@@ -28,6 +29,11 @@ const REDACT_PATHS = [
   '*.tokenSecret',
   's3SecretAccessKey',
   '*.s3SecretAccessKey',
+  'cookie',
+  '*.cookie',
+  'req.headers.cookie',
+  'Authorization',
+  '*.Authorization',
 ]
 
 function createLogger(Level = process.env.LOG_LEVEL?.trim() || 'info', Destination?: DestinationStream): Logger {
@@ -35,6 +41,11 @@ function createLogger(Level = process.env.LOG_LEVEL?.trim() || 'info', Destinati
     level: Level,
     base: { service: 'better-minio' },
     redact: { paths: REDACT_PATHS, censor: '[redacted]' },
+    serializers: {
+      url: (Value: unknown) => (typeof Value === 'string' ? safePath(Value) : '[redacted]'),
+      path: (Value: unknown) => (typeof Value === 'string' ? safePath(Value) : Value),
+      location: () => '[redacted]',
+    },
     mixin() {
       const Store = Storage.getStore()
       return Store === undefined ? {} : { request_id: Store.requestId }
