@@ -1,6 +1,6 @@
 # oci · 设计稿
 
-> 日期：2026-11-23 · 状态：**设计已收口，未落码**
+> 日期：2026-11-23 · 状态：**已落码**（契约见同目录 [spec.md](spec.md)；实现期缺口决定见 §十一）
 > 开关：`OCI_ENABLED` 默认 **`false`**（2026-11-23 拍板：镜像最小核心出厂）；`false` = `/v2/*` 与 `/token` 不挂、chunk 清理不起、registry 桶不建。kcplan 使用者 compose 里显式开启。
 > 上游：[AGENTS.md](../../../AGENTS.md) §4.6；[auth 设计](../../auth/design/design.md)（ociGate / `/token` / push 白名单）；[两 domain .kcplan 契约](../../../../../_Agents/handoff/design-2026-11-23-two-domain-kcplan.md)。
 > 下游：实现前先读本文件 → 同目录产出 `spec.md` → 按 spec 落码。
@@ -137,17 +137,21 @@ flowchart TD
 
 ```
 src/oci/
-  routes.ts     mountOci(app, deps)：/v2/* 全端点，内联 ociGate（pull/push 按方法）
-  manifest.ts   put/get/head/delete + 结构校验 + 引用完整性
-  blob.ts       get/head/delete + repo 链判据
-  upload.ts     POST/PATCH/PUT/DELETE 会话 + 流式 hash + CopyObject 收尾
-  index.ts      per-repo 索引读改写（If-Match 重试 + 进程锁）
-  errors.ts     distribution 错误渲染
-  gc.ts         chunk 清理定时器（+ 悬挂 blob GC 草图注释，不实现）
-src/api/objects.ts  补 copyObject 原语（server-side copy）
+  routes.ts       mountOci(app, deps)：/v2/* 全端点，内联 ociGate（pull/push 按方法）+ rateLimit
+  manifest.ts     put/get/head/delete + tags/list + 结构校验 + 引用完整性
+  blob.ts         get/head/delete + repo 链判据
+  upload.ts       POST/PATCH/PUT/DELETE/GET 会话 + 流式 hash + CopyObject 收尾
+  repo-index.ts   per-repo 索引读改写（If-Match 重试 + 进程锁）；不叫 index.ts，免目录导入歧义
+  errors.ts       distribution 错误渲染（OciError + GatewayError 映射）
+  gc.ts           chunk 清理定时器（+ 悬挂 blob GC 草图注释，不实现）
+  layout.ts       桶布局 key + digest / tag 语法
+  lock.ts         进程内按 key 串行锁
+  context.ts      内部依赖包
+src/api/registry.ts  oci 专用 S3 原语：putStream（8 MiB 有界、单片 Put / 多片 multipart）、putBytes 条件写、
+                     getBytes、getStream（Range）、copyObject（server-side）、listByPrefix、deleteMany
 ```
 
-- deps = `{ internalClient, registryBucket, stateStore, ociGate, serviceGate }`。
+- deps = `{ internalClient, registryBucket, stateStore, ociGate, uploadTtl, rateLimit, publicEndpoint? }`（serviceGate 不需要：/v2 只认 bearer；`_gc` 端点不做）。
 - 配置新增：`S3_REGISTRY_BUCKET`（默认 `kcregistry`）、`OCI_UPLOAD_TTL`（默认 3600）、`OCI_ENABLED`（默认 `false`，严格布尔）。
 - 无新增库（sha256 用 node:crypto；OCI 协议端点手写路由——协议是公开标准但无 Node 服务端库，客户端库 oras 只做验收工具）。
 - spike 清单：① MinIO CopyObject 同桶 server-side；② oras push 真实分块行为（PATCH 尺寸/次数）；③ 流式拼接 + hash 内存平稳。
@@ -181,3 +185,15 @@ src/api/objects.ts  补 copyObject 原语（server-side copy）
 - AGENTS.md §4.6：存储布局细化（blobs/repos/uploads 前缀 + registry 桶）；tag 索引维持 MinIO 对象（D1 选 A 则与原文一致）；补 tag 不可变、blob 跨 repo 共享、GC 分档。
 - auth 设计 §六.1：Redis/内存策略适用域细化为「瞬态会话/计数」，持久 registry 状态落 MinIO（D1 选 A 时）。
 - handoff 接口稿「registry 索引落 MinIO vs 轻表」开放项：收口为 MinIO 对象，无新基础设施。
+## 十一 · 实现期缺口决定（2026-11-23，spec 同步）
+
+- **端点补齐**：`GET /v2/<name>/blobs/uploads/<uuid>`（上传进度，204 + Range，按 push 鉴权）；`POST …/uploads/?digest=` 单请求 monolithic（201）；`?mount=&from=` 忽略、按普通 POST 降级（D6）。
+- **错误补充**：PATCH Content-Range 起点 ≠ 已收大小 → 416 `RANGE_INVALID`（带当前 Range）；声明长度 ≠ 实写 → 400 `SIZE_INVALID`；name 非法 → 400 `NAME_INVALID`；方法不对 405 / 未知端点 404（code `UNSUPPORTED`）；tag 语法非法 400 `TAG_INVALID`；chunk 丢失 → 400 `BLOB_UPLOAD_INVALID`（会话作废）；索引条件写重试耗尽 → 503 `UNKNOWN`；GatewayError `E_VALIDATION` → 400 `UNSUPPORTED`。
+- **只支持 sha256**；OCI image index / artifact manifest → 415（仅 OCI image manifest v1 与 Docker v2）。body.mediaType 与 Content-Type 都有且不同 → `MANIFEST_INVALID`。
+- **manifest 回读校验**：GET 时重算 sha256，不符 500（存储损坏不外泄）。
+- **blob 面 repo 不存在** → `NAME_UNKNOWN`；存在但未链 → `BLOB_UNKNOWN`。DELETE blob 只解链。
+- **会话存储 TTL = 2×OCI_UPLOAD_TTL**，逻辑过期看 expiresAt（最近活动 + TTL），保证过期会话仍能被 gc 扫到清 chunk。
+- **Location**：配置 `publicEndpoint` 回绝对 URL，否则相对路径。
+- **tags/list 分页**：`?n=&last=`（字典序）+ `Link: <…>; rel="next"`。
+- **putStream 内存上界**：8 MiB 一片；无 Content-Length 的 chunked PATCH 同路径，不需要知道总长。
+- **验收差异**：本机无 `oras` CLI，oras push/pull 由测试内按协议手写的 fetch 客户端代替（token → POST → PATCH → PUT → manifest → pull）；真机 oras 联测留部署环境。

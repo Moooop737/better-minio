@@ -106,3 +106,12 @@ src/ops/
 
 - AGENTS.md §4.7：health 补 Redis 探针口径；audit 落 stdout 日志行；限流默认值与按面 429；关闭 timeout 与 compose 配套。
 - index.ts 现有 /health 与 console.* 收编进 ops（实现时迁移，行为兼容）。
+## 十 · 实现期补充决策（2026-11-23，spec 同步）
+
+- 文件：request_id + 基础请求日志 middleware 单列 `request-id.ts`（`requestIdMiddleware` / `requestLogMiddleware` / `afterResponse`）。
+- `x-request-id` 只透传 `^[A-Za-z0-9._-]{1,128}$`，否则铸 uuid（防日志注入 / 超长）；回写响应头（不可变上游头则复制 Response 再写）。
+- audit `ip`：browser 身份取闸算出的 ip；其余按 `resolveClientIp(peer, XFF, trustedProxies)`——`auditMiddleware(logger, { trustedProxies })` 第二参数可选，缺省不信任 XFF（只记 peer）。
+- audit / 请求日志的 `afterResponse` 监听器跑在 http 上下文（ALS 不传播），`request_id` 由 `c.get('requestId')` 显式写入。
+- 限流 Redis 模式开 `rejectIfRedisNotReady`：连接非 ready 立即走 insurance，不等命令超时；insurance 兜底后仍异常 → 放行（不 500）。
+- logger serializers：顶层 `url` / `path` → pathname；`location` → `[redacted]`。
+- shutdown：`close()` 后每 250ms 再 `closeIdleConnections()`（在途请求结束后变空闲的 keep-alive 连接）；超时先 `closeAllConnections()` 再 exit 1；钩子单个失败只记日志。

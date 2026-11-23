@@ -30,8 +30,10 @@ interface ObjectPutOptions {
   ifNoneMatch?: string
 }
 
+/* extraQuery：签名前注入的自定义 query（如 access_token），SigV4 覆盖它，篡改即破签名 */
 interface ObjectPresignOptions {
   expiresIn: number
+  extraQuery?: Record<string, string>
   responseContentDisposition?: string
   responseContentType?: string
   responseCacheControl?: string
@@ -39,6 +41,7 @@ interface ObjectPresignOptions {
 
 interface ObjectPresignPutOptions {
   expiresIn: number
+  extraQuery?: Record<string, string>
   contentType?: string
 }
 

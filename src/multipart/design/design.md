@@ -1,6 +1,6 @@
 # multipart · 设计稿
 
-> 日期：2026-11-23 · 状态：**设计已收口，未落码**
+> 日期：2026-11-23 · 状态：**设计已收口，已落码**（契约见同目录 [spec.md](spec.md)）
 > 开关：`MULTIPART_ENABLED` 默认 `true`；`false` = 五端点不挂（404）、清理定时器不起（AGENTS.md §一·三）。
 > 上游：[AGENTS.md](../../../AGENTS.md) §4.5；[auth 设计](../../auth/design/design.md)（token）、[presign 设计](../../presign/design/design.md)（签名路径）、[proxy 设计](../../proxy/design/design.md)（分片 PUT 走数据面）。
 > 实物依据（2026-10-29 实测）：该 MinIO `ListMultipartUploads` **恒空**、`ListParts(uploadId)` **正常** → 会话必须自持久化 uploadId，对账走 ListParts 可行。
@@ -137,7 +137,7 @@ src/multipart/
   routes.ts             mountMultipart(app, deps)：五端点，内联 serviceGate
 ```
 
-- deps = `{ internalClient, publicClient, bucket, stateStore, tokenService, serviceGate }`。
+- deps = `{ internalClient, publicClient, bucket, stateStore, tokens, serviceGate, sessionTtl, keyScheme, events, rateLimit, now? }`（events：complete 成功 emit `object:complete {key, contentType}` 给 thumbnail；rateLimit 闸后调用，关闭时 null）。
 - 新增依赖：`ioredis`（可选连接，库必装）。配置新增：`REDIS_URL`（可选）、`MULTIPART_SESSION_TTL`（默认 86400）、`MULTIPART_ENABLED`（默认 `true`，严格布尔）。
 
 ## 七 · 验收
@@ -162,6 +162,17 @@ src/multipart/
 | D5 | 孤儿兜底 | MinIO 桶 ILM 规则（部署侧），网关不枚举 | **已定**（默认通过） |
 | D6 | 分法一致性 | create 必填 partSize（≥5MiB）；complete 非末片精确等于 partSize、末片 ≤ partSize；换分法 = 换会话 | **已定**（2026-11-23） |
 | D7 | 功能开关 | `MULTIPART_ENABLED` 默认 true；关 = 路由不挂、定时器不起 | **已定**（2026-11-23） |
+
+## 八·二 · 实现期补定（2026-11-23，spec 阶段）
+
+- **时间单位**：会话 `createdAt/expiresAt` 与响应 `expiresAt` 均为 epoch **秒**（同 JWT exp 口径）；`expiresAt <= now` 即过期（404）。
+- **partSize 上限**：5 GiB（S3 单片上限），越界 400 `E_VALIDATION`。
+- **MinIO 已不认 uploadId**（会话在、ListParts/Complete 回 NoSuchUpload）→ 删会话 + 404 `E_SESSION_NOT_FOUND`（与「会话不存在」同一交互：后端重新 create）。
+- **清单断档**：期望集内清单没给的编号，即使真源有片也记 `reason:'missing'`（客户端没报 ETag，网关无从对账）；客户端补传后须在清单里带上该片。
+- **ETag 比较**：去引号 / `W/` 前缀、不分大小写。
+- **complete 重签 TTL**：固定 300s（同 sign-part 默认）。
+- **校验错误**：400 `E_VALIDATION` 附 `issues`（复用 presign `formatIssues`，只含字段路径与文案）；`key` / `client_ip` / `expiresIn` 复用 presign schema，date 前缀复用 presign `applyKeyScheme`。
+- **清理器**：同一时刻只跑一轮；坏 JSON 会话直接删（无法 abort，ILM 兜底）；定时器 unref 不阻止进程退出。
 
 ## 九 · 与上游文档的差异（spec 阶段同步回写）
 
