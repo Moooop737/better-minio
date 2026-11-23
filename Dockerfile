@@ -2,9 +2,11 @@
 FROM node:24-slim
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci && npm cache clean --force
+RUN npm ci --omit=dev && npm cache clean --force
 COPY tsconfig.json ./
 COPY src ./src
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    GATEWAY_HOST=0.0.0.0
 EXPOSE 9100
+USER node
 CMD ["npx", "tsx", "src/index.ts"]
