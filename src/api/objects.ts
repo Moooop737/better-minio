@@ -1,12 +1,13 @@
 /**
  * 对象操作 —— put / stat / get / delete，错误统一成 ObjectStoreError；SDK 类型不泄出。
- * get/stat 在对象不存在时返回 null；get 返回 Readable body + Range 支持；put 支持 If-None-Match 条件写。
+ * get/stat 在对象不存在时返回 null；get 返回 Readable body + Range（含 contentRange）；put 收 Uint8Array | Readable。
  */
 
 export { putObject, statObject, getObject, deleteObject }
 
 import { PutObjectCommand, HeadObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import type { GetObjectCommandInput, PutObjectCommandInput, S3Client } from '@aws-sdk/client-s3'
+import type { Readable } from 'node:stream'
 import { ObjectStoreError } from './object-store'
 import type { ObjectStat, ObjectBody, ObjectGetOptions, ObjectPutOptions } from './object-store'
 
@@ -14,16 +15,17 @@ async function putObject(
   Client: S3Client,
   Bucket: string,
   Key: string,
-  Body: Uint8Array,
+  Body: Uint8Array | Readable,
   ContentType: string,
   Options?: ObjectPutOptions,
 ): Promise<void> {
   const input: PutObjectCommandInput = { Bucket, Key, Body, ContentType }
   if (Options?.ifNoneMatch !== undefined) input.IfNoneMatch = Options.ifNoneMatch
+  if (Options?.contentLength !== undefined) input.ContentLength = Options.contentLength
   try {
     await Client.send(new PutObjectCommand(input))
   } catch (err) {
-    throw new ObjectStoreError(`put ${Key} 失败`, err)
+    throw new ObjectStoreError(`put ${Key} 失败`, err, httpStatusOf(err) ?? undefined)
   }
 }
 
@@ -57,11 +59,12 @@ async function getObject(
       contentType: res.ContentType ?? null,
       contentLength: res.ContentLength ?? null,
       etag: res.ETag ?? null,
+      contentRange: res.ContentRange ?? null,
     }
   } catch (err) {
     if (isNotFound(err)) return null
     if (err instanceof ObjectStoreError) throw err
-    throw new ObjectStoreError(`get ${Key} 失败`, err)
+    throw new ObjectStoreError(`get ${Key} 失败`, err, httpStatusOf(err) ?? undefined)
   }
 }
 
@@ -75,6 +78,10 @@ async function deleteObject(Client: S3Client, Bucket: string, Key: string): Prom
 
 function isNotFound(err: unknown): boolean {
   const Name = (err as { name?: unknown } | null)?.name
+  return Name === 'NotFound' || Name === 'NoSuchKey' || httpStatusOf(err) === 404
+}
+
+function httpStatusOf(err: unknown): number | null {
   const Status = (err as { $metadata?: { httpStatusCode?: number } } | null)?.$metadata?.httpStatusCode
-  return Name === 'NotFound' || Name === 'NoSuchKey' || Status === 404
+  return typeof Status === 'number' ? Status : null
 }

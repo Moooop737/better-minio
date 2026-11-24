@@ -60,14 +60,18 @@ function s3ErrorResponse(c: Context, Status: number, Code: string, Message: stri
 ### `objects.ts` — 控制端点 handler
 
 ```ts
-export { createObjectHandlers, objectKeyBodySchema }
-function createObjectHandlers(Deps: { internal: S3Client; bucket: string; events: EventBus }): { stat: Handler<AppEnv>; remove: Handler<AppEnv> }
+export { createObjectHandlers, objectKeyBodySchema, objectGetBodySchema, OBJECT_KEY_HEADER }
+function createObjectHandlers(Deps: { internal: S3Client; bucket: string; events: EventBus }): {
+  stat: Handler<AppEnv>; remove: Handler<AppEnv>; get: Handler<AppEnv>; put: Handler<AppEnv>
+}
 ```
 
-- body `{key}`，key 用 presign 的 `keySchema` + `parseJsonBody`（同校验）。坏 JSON / 校验失败 → 400 `E_VALIDATION`。
+- `stat` / `delete` / `get`：body `{key}`（`get` 另带 `range?`），key 用 presign 的 `keySchema` + `parseJsonBody`（同校验）。坏 JSON / 校验失败 → 400 `E_VALIDATION`。
 - stat：200 `{size, contentType, etag}`；不存在 → 404 `E_NOT_FOUND`。
 - delete：204（不存在也 204）；成功 emit `object:delete {key}`。
-- api 层失败（ObjectStoreError）→ 502 `E_UPSTREAM`（message 通用）。`auditKey = key`。
+- get：200 流式 body，头带 `content-type` / `content-length` / `etag`；有 `range` 时上游 206 → 回 206 + `content-range`（`Readable.toWeb` 转流，禁 buffer）；不存在 → 404 `E_NOT_FOUND`。
+- put：key 走 query `?key=`（必填，`keySchema` 校验，缺失/非法 → 400 `E_VALIDATION`；percent-encoded 以承载中文/空格），其余元数据在 header——`content-type`（缺省 `application/octet-stream`）、`if-none-match`（可选）、`content-length`（可选，有则传给 SDK 避免 chunked）。body = `c.env.incoming`（Node Readable）直接进 api 层。成功 204；上游 412 → 412 `E_PRECONDITION_FAILED`（message「对象已存在」）；**不发** `object:put` 事件。
+- api 层失败（ObjectStoreError，非 412）→ 502 `E_UPSTREAM`（message 通用）。`auditKey = key`。
 
 ### `routes.ts` — 挂载
 
@@ -79,7 +83,7 @@ function mountProxyData(App: Hono<AppEnv>, Deps: { internalEndpoint: string; buc
 interface ProxyDataHandle { close(): Promise<void> }   // 关闭上游连接池（优雅关闭最后一步）
 ```
 
-- 控制：`POST /objects/stat`、`POST /objects/delete`，链 = serviceGate → rateLimit → handler。
+- 控制：`POST /objects/stat`、`POST /objects/delete`、`POST /objects/get`、`POST /objects/put`，链 = serviceGate → rateLimit → handler。
 - 数据：`App.all('/:bucket/*')`（Hono 该模式也匹配 `/:bucket`），链 = bucketCheck → cors → methodCheck → dataPlaneGate → rateLimit → forward。
   - bucketCheck（最先，含 OPTIONS）：首段 bucket ≠ 配置 → 404 `NoSuchBucket`。理由：catch-all 也兜住关闭模块的路径（`OCI_ENABLED=false` 的 `/v2/`、`THUMBNAIL_ENABLED=false` 的 `/thumbnail/*`），这些必须是 404 而非 405。
   - cors：OPTIONS 204（不过闸）。
@@ -94,4 +98,4 @@ interface ProxyDataHandle { close(): Promise<void> }   // 关闭上游连接池�
 - `s3-error.test.ts`：映射表、429 Retry-After、未知 500 通用、RequestId、HEAD 无 body、XML 转义。
 - `cors.test.ts`：白名单预检头、非白名单 204 无头、白名单空无头、Vary、Expose。
 - `forward.test.ts`（假上游 node:http，测转发器本身）：Host 原样、原始 target 保真（空格/中文/`+`/`%2B`）、hop-by-hop 剥离、上游 `access-control-*` 剥离、上游错误 XML 原样透传、上游不可达 502 XML 且不含地址、100MB 上传+下载网关子进程 RSS 增长 < 60MB（`fixtures/gateway-child.ts`，`--max-semi-space-size=1`）、上下行背压有界、客户端断连 → 上游请求被销毁（下载与上传两向）、bytesUp/bytesDown 计数。
-- `routes.test.ts`（moto 端到端：mountPresign → 网关 → moto）：GET 200 / Range 206 / HEAD ETag；PUT 200 + object:put 事件；分片 PUT 不发事件；If-None-Match `*` 412；特殊字符 key 往返；无 token / 篡改 token 401 XML；换 IP 403；get token 打 PUT 403；DELETE/POST 405；他桶 404（含 POST /thumbnail/x、GET /v2/、OPTIONS 他桶，桶判定先于方法）；桶级 404；`/objects/stat` 200/404；`/objects/delete` 204×2 + 事件；无 service token 401；CORS 预检 + 实际响应 expose ETag；错误体与日志无 MinIO 地址 / token。
+- `routes.test.ts`（moto 端到端：mountPresign → 网关 → moto）：GET 200 / Range 206 / HEAD ETag；PUT 200 + object:put 事件；分片 PUT 不发事件；If-None-Match `*` 412；特殊字符 key 往返；无 token / 篡改 token 401 XML；换 IP 403；get token 打 PUT 403；DELETE/POST 405；他桶 404（含 POST /thumbnail/x、GET /v2/、OPTIONS 他桶，桶判定先于方法）；桶级 404；`/objects/stat` 200/404；`/objects/delete` 204×2 + 事件；`/objects/get` 200 正文 / Range 206 + Content-Range / 404；`/objects/put` 204 → stat 可见（流式 body）/ `if-none-match` 命中 412 / 缺 `x-object-key` 400；无 service token 401；CORS 预检 + 实际响应 expose ETag；错误体与日志无 MinIO 地址 / token。

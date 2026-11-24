@@ -1,6 +1,6 @@
 /**
  * proxy 挂载 —— 控制端点与 S3 数据面分两次挂（数据面 catch-all 必须最后挂）。
- *   mountProxyControl：POST /objects/stat、/objects/delete；链 serviceGate → rateLimit → handler。
+ *   mountProxyControl：POST /objects/stat、/objects/delete、/objects/get、/objects/put；链 serviceGate → rateLimit → handler。
  *   mountProxyData：`/:bucket/*`（含 `/:bucket`）；链 桶 404 → CORS（OPTIONS 204）→ 方法 405 / 桶级 404 → dataPlaneGate → rateLimit → 透明转发。
  * 字节数随流实时 c.set('bytesUp' / 'bytesDown')，ops 审计在 outgoing 'close' 读取；非分片 PUT 成功 emit object:put。
  * 用法：`mountProxyControl(app, deps)`；`const Data = mountProxyData(app, deps)`，优雅关闭最后 `await Data.close()`。
@@ -52,6 +52,8 @@ function mountProxyControl(App: Hono<AppEnv>, Deps: ProxyControlDeps): void {
   const Limit = rateLimitMiddleware(Deps.rateLimit)
   App.post('/objects/stat', Deps.serviceGate, Limit, Handlers.stat)
   App.post('/objects/delete', Deps.serviceGate, Limit, Handlers.remove)
+  App.post('/objects/get', Deps.serviceGate, Limit, Handlers.get)
+  App.post('/objects/put', Deps.serviceGate, Limit, Handlers.put)
 }
 
 function mountProxyData(App: Hono<AppEnv>, Deps: ProxyDataDeps): ProxyDataHandle {

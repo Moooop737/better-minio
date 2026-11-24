@@ -67,12 +67,17 @@ Hono 按注册顺序首匹配，**控制面先挂、S3 catch-all 最后**：
 
 ## 三 · 控制端点（service token）
 
-| 端点 | 请求 | 成功 | 不存在 |
+| 端点 | 请求 | 成功 | 其它 |
 |---|---|---|---|
 | `POST /objects/stat` | `{key}` | 200 `{size, contentType, etag}` | **404 `E_NOT_FOUND`**（D3） |
 | `POST /objects/delete` | `{key}` | 204 | 204（S3 DeleteObject 幂等语义） |
+| `POST /objects/get` | `{key, range?}` | 200 流式 body + `content-type/content-length/etag`；有 range → 206 + `content-range` | **404 `E_NOT_FOUND`** |
+| `POST /objects/put` | query `key` + header `content-type` / `if-none-match?` / `content-length?`，body 为原始流 | 204 | 条件写冲突 → **412 `E_PRECONDITION_FAILED`**（D6） |
 
-- 走 api 层 `stat` / `delete`（internal client，网关持 MinIO 凭证执行）；key 校验同 presign（非空、≤1024、不以 `/` 开头）。
+- 走 api 层 `stat` / `delete` / `get` / `put`（internal client，网关持 MinIO 凭证执行）；key 校验同 presign（非空、≤1024、不以 `/` 开头）。
+- `get` 的 body 用 `Readable.toWeb` 转流后回响应，**禁 buffer**；`put` 的 body 直接取 `c.env.incoming`（Node Readable），禁先读进内存。
+- `put` 的 key 走 query（`?key=`）而非 JSON / header：请求体本身是上传字节流，无法再带 JSON 元数据；key 可含中文 / 空格，HTTP header 值只收 ASCII。
+- `put` **不发** `object:put` 事件：派生（缩略图等）只对浏览器直传的入库原文有语义，服务端写入不应触发。
 - 上游失败 → 502 `E_UPSTREAM`，message 通用，不含 MinIO 地址 / 凭证。
 - 错误体 JSON `{code,message}`（控制面口径，auth §六）。
 
@@ -112,7 +117,7 @@ src/proxy/
   forward.ts    createForwarder({endpoint}).forward({rawTarget, method, headers, body, signal}) → {status, headers, body}
   cors.ts       dataPlaneCors(origins) middleware
   s3-error.ts   renderS3Error(GatewayError) / 上游透传判定
-  objects.ts    /objects/stat /objects/delete handlers（api.stat/delete）
+  objects.ts    /objects/stat|delete|get|put handlers（api.stat/delete/get/put）
   routes.ts     mountProxyControl(app, deps)：控制端点；mountProxyData(app, deps)：S3 catch-all（最后挂）
 ```
 
@@ -143,6 +148,7 @@ src/proxy/
 | D3 | stat 不存在 | 404 `E_NOT_FOUND` | **已定**（默认通过） |
 | D4 | CORS | env `CORS_ORIGINS` 白名单，默认空；OPTIONS 不过闸 | **已定**（默认通过） |
 | D5 | 上游错误 | MinIO S3 XML 原样透传，不重包 | **已定**（默认通过） |
+| D6 | `put` 条件写冲突 | 上游 412 → 控制面 412 `E_PRECONDITION_FAILED`（message「对象已存在」）；`put` 的 key 走 `x-object-key` header（body 已是流） | **已定**（2026-11-24 补，供后端 ObjectStore HTTP 实现消费） |
 
 ## 九 · 与上游文档的差异（spec 阶段同步回写）
 

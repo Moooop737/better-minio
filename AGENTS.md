@@ -80,7 +80,7 @@ test/             镜像 src/ 结构
 |---|---|---|
 | `/health` | GET | ops |
 | `/<bucket>/<key>`（标准 S3 路径） | GET/PUT/HEAD（其余 405） | proxy（透明代理 MinIO） |
-| `/objects/stat` `/objects/delete` | POST | proxy（服务端控制，服务 token） |
+| `/objects/stat` `/objects/delete` `/objects/get` `/objects/put` | POST | proxy（服务端控制，服务 token） |
 | `/presign/put` `/presign/get` | POST | presign |
 | `/multipart/create` `/multipart/sign-part` `/multipart/list-parts` `/multipart/complete` `/multipart/abort` | POST | multipart（`MULTIPART_ENABLED`） |
 | `/thumbnail/generate` | POST | thumbnail（`THUMBNAIL_ENABLED`） |
@@ -95,7 +95,7 @@ test/             镜像 src/ 结构
 
 - `client.ts`：一个 `createS3Client(opts)` 工厂，按 endpoint 建两个实例——**internal**（转发，`S3_INTERNAL_ENDPOINT`）/ **public**（签名，`S3_PUBLIC_ENDPOINT`）。均 `requestChecksumCalculation/responseChecksumValidation: 'WHEN_REQUIRED'`、`forcePathStyle`。
 - `bucket.ts`：`pingBucket` / `ensureBucket`（HeadBucket→404 则 CreateBucket；3s 上限）。
-- `objects.ts`：`put`（`If-None-Match` 条件写）/ `stat`（HEAD，404→null）/ `get`（Range，body 为 Readable）/ `delete`。错误归一，SDK 类型不泄出。
+- `objects.ts`：`put`（`If-None-Match` 条件写，body 收 `Uint8Array | Readable`，可选 `contentLength`）/ `stat`（HEAD，404→null）/ `get`（Range，body 为 Readable）/ `delete`。错误归一（`ObjectStoreError.status` 保上游 HTTP 状态），SDK 类型不泄出。
 - `presign.ts`：`presignGet`（TTL、response-disposition/type/cache）/ `presignPut`（TTL、`signableHeaders: content-type`）。
 - **验收**：`/health` 探测通；put→stat→get→delete 往返一致；presignGet `200`、Range `206`、presignPut 对类型 `200`/错类型 `403`。
 
@@ -103,7 +103,7 @@ test/             镜像 src/ 结构
 
 网关自己就是标准 S3 端点，**透明代理**到内网 MinIO（`127.0.0.1:9000`）：
 - 浏览器 / 后端都用 presigned URL 打网关（标准 S3 路径 `GET/PUT/HEAD /<bucket>/<key>`；DELETE/POST → 405 `MethodNotAllowed`，删除走 `/objects/delete`）；网关校验 token/IP 后**原样转发**给 MinIO（method/path/query/headers/Host 全保持，body stream pipe 禁 buffer），MinIO 验 S3 签名。
-- 后端少数服务端动作（stat/delete 等 presigned 不便）走控制端点 `/objects/stat` `/objects/delete`（服务 token），网关用 MinIO 凭证执行。
+- 后端少数服务端动作（stat/delete/get/put 等 presigned 不便）走控制端点 `/objects/stat` `/objects/delete` `/objects/get` `/objects/put`（服务 token），网关用 MinIO 凭证执行；`get` / `put` 走流式 body（禁 buffer），`put` 的 key 在 query（`?key=`，可含中文/空格），`content-type` / `if-none-match` 在 header。
 - 路由分流：`/v2`（oci）· 标准 S3 路径（proxy）· `/presign` `/token` `/health`（控制）。
 - 数据面 CORS：`CORS_ORIGINS` 白名单（默认空 = 不开），OPTIONS 预检不过闸。错误体：数据面 S3 XML、控制面 JSON `{code,message}`。
 - **验收**：100MB 流式不 OOM；Range `206`；`If-None-Match` 命中 `412`；Host 透传签名通过；presigned 直连网关 `200/206`；DELETE/POST `405`；其他 bucket `404 NoSuchBucket`。

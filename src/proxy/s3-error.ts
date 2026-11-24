@@ -21,6 +21,7 @@ const S3_ERROR_MAP: Record<GatewayErrorCode, { status: number; code: string }> =
   E_SCOPE: { status: 403, code: 'AccessDenied' },
   E_VALIDATION: { status: 400, code: 'InvalidArgument' },
   E_PART_SIZE_MISMATCH: { status: 400, code: 'InvalidArgument' },
+  E_PRECONDITION_FAILED: { status: 412, code: 'PreconditionFailed' },
   E_NOT_FOUND: { status: 404, code: 'NoSuchKey' },
   E_SESSION_NOT_FOUND: { status: 404, code: 'NoSuchKey' },
   E_RATE_LIMIT: { status: 429, code: 'SlowDown' },

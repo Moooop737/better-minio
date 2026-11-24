@@ -4,16 +4,37 @@
  */
 
 import { CreateBucketCommand, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3'
+import { Readable } from 'node:stream'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { GatewayError } from '../../src/core/errors'
 import { logger } from '../../src/ops/logger'
 import { startS3, s3Available } from '../helpers/s3'
 import type { TestS3 } from '../helpers/s3'
-import { startGateway } from './harness'
+import { SERVICE_TOKEN, startGateway } from './harness'
 import type { Gateway } from './harness'
 
 const BUCKET = 'kbfile'
 const CLIENT_IP = '127.0.0.1'
+
+/* 控制端点 put：body 走流（node Readable → web），content-length 显式给，避免 SDK 走 chunked */
+async function putStream(
+  G: Gateway,
+  Key: string | null,
+  Text: string,
+  Extra: Record<string, string> = {},
+  Token: string | null = SERVICE_TOKEN,
+): Promise<Response> {
+  const Headers: Record<string, string> = {
+    ...(Token !== null ? { authorization: `Bearer ${Token}` } : {}),
+    'content-type': 'text/plain',
+    'content-length': String(Buffer.byteLength(Text)),
+    ...Extra,
+  }
+
+  const Body = Readable.toWeb(Readable.from([Buffer.from(Text)])) as ReadableStream<Uint8Array>
+  const Path = Key === null ? '/objects/put' : `/objects/put?key=${encodeURIComponent(Key)}`
+  return fetch(`${G.url}${Path}`, { method: 'POST', headers: Headers, body: Body, duplex: 'half' } as RequestInit)
+}
 
 describe.skipIf(!s3Available)('proxy 数据面 + 控制端点（moto）', () => {
   let S3: TestS3
@@ -71,7 +92,8 @@ describe.skipIf(!s3Available)('proxy 数据面 + 控制端点（moto）', () => 
       expect(Head.headers.get('content-length')).toBe('11')
     })
 
-    it('responseContentDisposition 原样出现在响应头', async () => {
+    /* moto 不实现 response-content-disposition（S3 GetObject 的 response-* 查询参数），真 MinIO 行为由 change 4.x 真链路验收 */
+    it.skip('responseContentDisposition 原样出现在响应头', async () => {
       await seed('docs/d.pdf', 'pdf')
       const Disposition = "attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf"
       const Url = await presignUrl(Gw, 'get', 'docs/d.pdf', { responseContentDisposition: Disposition, responseContentType: 'application/pdf' })
@@ -264,6 +286,42 @@ describe.skipIf(!s3Available)('proxy 数据面 + 控制端点（moto）', () => 
       Off()
       expect((await Gw.control('/objects/stat', { key: 'ctl/d.txt' })).status).toBe(404)
       expect(Seen).toEqual([{ key: 'ctl/d.txt' }, { key: 'ctl/d.txt' }])
+    })
+
+    it('get 200 流式正文 / Range 206 + Content-Range / 不存在 404', async () => {
+      await seed('ctl/g.txt', 'hello world')
+      const Full = await Gw.control('/objects/get', { key: 'ctl/g.txt' })
+      expect(Full.status).toBe(200)
+      expect(Full.headers.get('content-type')).toContain('text/plain')
+      expect(Full.headers.get('etag')).toMatch(/^"/)
+      expect(await Full.text()).toBe('hello world')
+      const Ranged = await Gw.control('/objects/get', { key: 'ctl/g.txt', range: 'bytes=0-4' })
+      expect(Ranged.status).toBe(206)
+      expect(Ranged.headers.get('content-range')).toBe('bytes 0-4/11')
+      expect(await Ranged.text()).toBe('hello')
+      const Miss = await Gw.control('/objects/get', { key: 'ctl/missing.txt' })
+      expect(Miss.status).toBe(404)
+      expect(((await Miss.json()) as { code: string }).code).toBe('E_NOT_FOUND')
+    })
+
+    it('put 204 流式写入后 stat/get 可见；if-none-match 命中 412；缺 key query 400', async () => {
+      const Res = await putStream(Gw, 'ctl/p.txt', 'streamed body')
+      expect(Res.status).toBe(204)
+      const Stat = await Gw.control('/objects/stat', { key: 'ctl/p.txt' })
+      expect(Stat.status).toBe(200)
+      expect(((await Stat.json()) as { size: number }).size).toBe(13)
+      expect(await (await Gw.control('/objects/get', { key: 'ctl/p.txt' })).text()).toBe('streamed body')
+      const Conflict = await putStream(Gw, 'ctl/p.txt', 'again', { 'if-none-match': '*' })
+      expect(Conflict.status).toBe(412)
+      expect(((await Conflict.json()) as { code: string }).code).toBe('E_PRECONDITION_FAILED')
+      const NoKey = await putStream(Gw, null, 'x')
+      expect(NoKey.status).toBe(400)
+      expect(((await NoKey.json()) as { code: string }).code).toBe('E_VALIDATION')
+    })
+
+    it('get/put 无 service token → 401', async () => {
+      expect((await Gw.control('/objects/get', { key: 'ctl/g.txt' }, null)).status).toBe(401)
+      expect((await putStream(Gw, 'ctl/noauth.txt', 'x', {}, null)).status).toBe(401)
     })
 
     it('无 / 错 service token → 401 E_SERVICE_TOKEN JSON', async () => {
