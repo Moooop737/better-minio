@@ -143,6 +143,7 @@ test/             镜像 src/ 结构
 - `.kcplan` → OCI artifact：config=`application/vnd.kc.plan.config.v1+json`、layer=`.kcplan` zip（`application/vnd.kc.plan.layer.v1.tar+gzip`）、manifest annotations=`name/version/plan_id/protocol_version/source/required_capabilities`、tag=version、digest=sha256。
 - 存储：独立 registry 桶 `S3_REGISTRY_BUCKET`（默认 `kcregistry`）；blob/manifest → `blobs/sha256/<hex>`（内容寻址，跨 repo 共享）；`tag→digest` 索引 → 每 repo 一个 MinIO 对象 `repos/<name>/index.json`（registry 状态，非文件元数据，无 Redis 重启不丢）；上传 chunk → `uploads/<uuid>/…`（收尾流式 hash + CopyObject）。tag 不可变（同 digest 幂等、异 digest 409）。
 - D1 push / D2 pull；上传 chunk 清理实现；悬挂 blob GC（触发点，先不做）。
+- 临时对象清理（chunk / final）走**逐条 DELETE**：AWS SDK 的 `DeleteObjects` 会强制附 CRC32，真 MinIO 返回 `InvalidRequest`（moto 不复现）；OCI 清理对象量是个位数，逐条请求代价可忽略。2026-11-24 真网关验证。
 - **验收**：`oras push` / `oras pull` 通；digest 校验；tag 解析正确；错误码符合 distribution spec。
 
 ### 4.7 `ops/` · 安全运维

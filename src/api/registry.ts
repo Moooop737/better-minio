@@ -7,7 +7,7 @@
  *   getStream：流式读（Range 透传），不存在 null；Range 越界返回 { kind:'range-not-satisfiable' }。
  *   copyObject：同桶 server-side 复制（数据不过网关；S3 单次上限 5 GiB）。
  *   listByPrefix：前缀列举（分页取全）带 size / lastModified。
- *   deleteMany：批量删除（每批 ≤1000），不存在的 key 视为成功。
+ *   deleteMany：逐个删除（MinIO 不兼容 SDK 批量删除的强制 CRC32），不存在的 key 视为成功。
  */
 
 export { putStream, putBytes, getBytes, getStream, copyObject, listByPrefix, deleteMany, STREAM_PART_SIZE }
@@ -20,7 +20,7 @@ import {
   CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateMultipartUploadCommand,
-  DeleteObjectsCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   ListObjectsV2Command,
   PutObjectCommand,
@@ -224,16 +224,15 @@ async function listByPrefix(Client: S3Client, Bucket: string, Prefix: string): P
 
 async function deleteMany(Client: S3Client, Bucket: string, Keys: string[]): Promise<number> {
   let Deleted = 0
-  for (let Offset = 0; Offset < Keys.length; Offset += 1000) {
-    const Batch = Keys.slice(Offset, Offset + 1000)
+  /* 逐个 DELETE 而非 DeleteObjects：AWS SDK 会为批量删除强制附 CRC32，MinIO 对此返回 InvalidRequest；
+     OCI 清理的对象量是个位数（chunk + final），逐条请求的代价可以忽略。 */
+  for (const Key of Keys) {
     try {
-      const Res = await Client.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: Batch.map((Key) => ({ Key })), Quiet: true } }))
-      const Failed = (Res.Errors ?? []).filter((Item) => Item.Code !== 'NoSuchKey')
-      if (Failed.length > 0) throw new ObjectStoreError(`delete 批量失败 ${Failed.length} 个`)
-      Deleted += Batch.length
+      await Client.send(new DeleteObjectCommand({ Bucket, Key }))
+      Deleted += 1
     } catch (err) {
-      if (err instanceof ObjectStoreError) throw err
-      throw new ObjectStoreError(`delete 批量失败`, err)
+      if (isNotFound(err)) continue
+      throw new ObjectStoreError(`delete ${Key} 失败`, err)
     }
   }
   return Deleted
